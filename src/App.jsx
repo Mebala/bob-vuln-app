@@ -6,7 +6,7 @@ export default function App() {
   const userInput = "<img src=x onerror=alert(1)>";
 
   // ❌ VULN 1: dangerouslySetInnerHTML without sanitization (XSS)
-  const renderHTML = () => (
+  const renderHTML = () =>  (
     <div dangerouslySetInnerHTML={{ __html: userInput }} />
   );
 
