@@ -1,0 +1,227 @@
+name: 🛡️ Bob Auto-Fix
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  # ── 1. SCA: Fix vulnerable npm packages ──────────────────────────────────
+  sca:
+    name: 📦 SCA Fix
+    runs-on: ubuntu-latest
+    outputs:
+      fixed: ${{ steps.fix.outputs.fixed }}
+      summary: ${{ steps.fix.outputs.summary }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - run: npm install --legacy-peer-deps
+
+      - name: Scan + Auto-Fix
+        id: fix
+        run: |
+          BEFORE=$(npm audit --json 2>/dev/null | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          v=d.get('metadata',{}).get('vulnerabilities',{})
+          print(sum(x for x in v.values() if isinstance(x,int)))
+          " || echo 0)
+
+          if [ "$BEFORE" -eq 0 ]; then
+            echo "fixed=false" >> $GITHUB_OUTPUT
+            echo "summary=✅ No SCA vulnerabilities" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          npm audit fix --force || true
+
+          AFTER=$(npm audit --json 2>/dev/null | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          v=d.get('metadata',{}).get('vulnerabilities',{})
+          print(sum(x for x in v.values() if isinstance(x,int)))
+          " || echo 0)
+
+          FIXED=$((BEFORE - AFTER))
+          echo "fixed=true" >> $GITHUB_OUTPUT
+          echo "summary=📦 SCA: fixed $FIXED/$BEFORE vulns ($AFTER remaining)" >> $GITHUB_OUTPUT
+
+      - name: Commit fixes
+        if: steps.fix.outputs.fixed == 'true'
+        run: |
+          git config user.name "Bob Security Bot"
+          git config user.email "bob@security.internal"
+          git add package.json package-lock.json
+          git diff --staged --quiet || git commit -m "🔒 Bob [SCA]: auto-fixed vulnerable packages"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── 2. SAST: Fix insecure code patterns ──────────────────────────────────
+  sast:
+    name: 🔬 SAST Fix
+    runs-on: ubuntu-latest
+    needs: sca
+    outputs:
+      fixed: ${{ steps.fix.outputs.fixed }}
+      summary: ${{ steps.fix.outputs.summary }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Semgrep
+        run: pip install semgrep --quiet
+
+      - name: Scan
+        run: |
+          semgrep scan \
+            --config "p/owasp-top-ten" \
+            --config "p/react" \
+            --config "p/secrets" \
+            --json --output /tmp/semgrep.json \
+            --no-git-ignore . || true
+
+      - name: Auto-Patch
+        id: fix
+        run: |
+          COUNT=$(python3 -c "
+          import json,os
+          d=json.load(open('/tmp/semgrep.json')) if os.path.exists('/tmp/semgrep.json') else {'results':[]}
+          print(len(d.get('results',[])))
+          ")
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "fixed=false" >> $GITHUB_OUTPUT
+            echo "summary=✅ No SAST issues" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          node scripts/sast-autofix.js /tmp/semgrep.json
+
+          PATCHED=$(cat /tmp/sast-patch-count.txt 2>/dev/null || echo 0)
+          REMAINING=$((COUNT - PATCHED))
+          echo "fixed=true" >> $GITHUB_OUTPUT
+          echo "summary=🔬 SAST: patched $PATCHED/$COUNT findings ($REMAINING remaining)" >> $GITHUB_OUTPUT
+
+      - name: Commit fixes
+        if: steps.fix.outputs.fixed == 'true'
+        run: |
+          git config user.name "Bob Security Bot"
+          git config user.email "bob@security.internal"
+          git add -A
+          git diff --staged --quiet || git commit -m "🔒 Bob [SAST]: auto-patched insecure code patterns"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── 3. IaC: Harden Dockerfile / K8s manifests ────────────────────────────
+  iac:
+    name: 🏗️ IaC Fix
+    runs-on: ubuntu-latest
+    needs: sast
+    outputs:
+      fixed: ${{ steps.fix.outputs.fixed }}
+      summary: ${{ steps.fix.outputs.summary }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.ref }}
+
+      - name: Install Checkov
+        run: pip install checkov --quiet
+
+      - name: Scan + Auto-Fix
+        id: fix
+        run: |
+          checkov -d . --output json --output-file-path /tmp/checkov.json \
+            --framework dockerfile,kubernetes --quiet --compact || true
+
+          FAILS=$(python3 -c "
+          import json,os
+          if not os.path.exists('/tmp/checkov.json'): print(0); exit()
+          d=json.load(open('/tmp/checkov.json'))
+          items = d if isinstance(d,list) else [d]
+          print(sum(len(r.get('results',{}).get('failed_checks',[])) for r in items))
+          " || echo 0)
+
+          if [ "$FAILS" -eq 0 ]; then
+            echo "fixed=false" >> $GITHUB_OUTPUT
+            echo "summary=✅ No IaC issues" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          python3 scripts/iac-autofix.py /tmp/checkov.json
+          echo "fixed=true" >> $GITHUB_OUTPUT
+          echo "summary=🏗️ IaC: hardened Dockerfile/K8s ($FAILS checks)" >> $GITHUB_OUTPUT
+
+      - name: Commit fixes
+        if: steps.fix.outputs.fixed == 'true'
+        run: |
+          git config user.name "Bob Security Bot"
+          git config user.email "bob@security.internal"
+          git add -A
+          git diff --staged --quiet || git commit -m "🔒 Bob [IaC]: hardened Dockerfile and K8s manifests"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── 4. Report: PR comment + open tickets for unfixed ─────────────────────
+  report:
+    name: 📋 Report
+    runs-on: ubuntu-latest
+    needs: [sca, sast, iac]
+    if: always()
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: bob-report
+          message: |
+            ## ⬡ Bob Security Scan — Results
+
+            | Job | Result |
+            |-----|--------|
+            | ${{ needs.sca.outputs.summary }} | ${{ needs.sca.result == 'success' && '✅' || '⚠️' }} |
+            | ${{ needs.sast.outputs.summary }} | ${{ needs.sast.result == 'success' && '✅' || '⚠️' }} |
+            | ${{ needs.iac.outputs.summary }} | ${{ needs.iac.result == 'success' && '✅' || '⚠️' }} |
+
+            > Auto-fixes committed by Bob. Unfixed findings logged as Issues.
+            > Commit: `${{ github.sha }}`
+
+      - name: Open issues for unfixed findings
+        run: |
+          node scripts/create-gh-issues.js \
+            "${{ secrets.GITHUB_TOKEN }}" \
+            "${{ github.repository }}" \
+            "${{ github.sha }}" \
+            "${{ github.ref_name }}" \
+            "${{ needs.sca.result }}" \
+            "${{ needs.sast.result }}" \
+            "${{ needs.iac.result }}" || true
